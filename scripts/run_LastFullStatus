@@ -1,0 +1,154 @@
+#!/bin/sh
+#! -*- perl -*-
+eval 'exec /usr/bin/perl -x -S $0 ${1+"$@"} ;'
+  if 0;
+
+#
+# Author:  Ulrich Leodolter
+# Date:    2009-01-26
+# Comment: Print Bacula last Full Job Status
+#
+
+package LastFullStatus;
+
+use strict;
+use Bweb;
+use Data::Dumper;
+use Getopt::Long;
+
+my $conf = new Bweb::Config( config_file => $Bweb::config_file );
+$conf->load();
+
+my $bweb = new Bweb( info => $conf )
+  or die("Bweb config failed\n");
+
+my $days   = 1;
+my $group  = "Users";
+my $pool   = "DiskBackup";
+my $result = Getopt::Long::GetOptions(
+    "days=i"  => \$days,     # search i days in the past
+    "pool=s"  => \$pool,     # backup pool
+    "group=s" => \$group,    # bweb client group
+);
+
+print <<EOT
+
+$group Full Backup Jobs (last $days days) sorted by Bytes:
+                 Name           Pool      Bytes      Files   StartTime            Duration
+===============================================================================================
+EOT
+  ;
+list_full_jobs($bweb);
+
+$bweb->dbh_disconnect;
+
+print <<EOT
+===============================================================================================
+
+--
+Bacula
+It comes by night and sucks the vital essence from your computers. 
+http://$ENV{HOSTNAME}/bweb
+EOT
+  ;
+exit 0;
+
+#
+# subroutines
+#
+sub list_full_jobs {
+    my $bweb = shift;
+
+    my $jobs = $bweb->dbh_selectall_arrayref(
+'SELECT Job.Name,Pool.Name,JobBytes,JobFiles,StartTime,TIMEDIFF(EndTime,StartTime) as Duration FROM Job
+LEFT JOIN Pool USING (PoolId) WHERE ClientId IN
+(SELECT Client.ClientId FROM Client,client_group_member,client_group
+  WHERE Client.ClientId = client_group_member.ClientId
+    AND client_group.client_group_name = "' . $group . '"
+    AND client_group.client_group_id = client_group_member.client_group_id)
+    AND Job.RealEndTime > SUBDATE(NOW(),INTERVAL ' . $days . ' DAY)
+    AND Level="F" AND Type in ("B","C") AND JobStatus="T" AND JobFiles>0 AND Pool.Name LIKE "'
+          . $pool
+          . '%" ORDER BY StartTime DESC,JobBytes DESC'
+    );
+
+    foreach my $job (@$jobs) {
+        printf "%22s %14s %10s %10s %20s %9s\n", $job->[0], $job->[1],
+          human_size( $job->[2] ), $job->[3], $job->[4], $job->[5];
+    }
+
+    #   print ::Dumper($job);
+}
+
+# display Mb/Gb/Kb
+sub human_size {
+    my @unit   = qw(B KB MB GB TB);
+    my $val    = shift || 0;
+    my $i      = 0;
+    my $format = '%i %s';
+    while ( $val / 1024 > 1 ) {
+        $i++;
+        $val /= 1024;
+    }
+    $format = ( $i > 0 ) ? '%0.1f %s' : '%i %s';
+    return sprintf( $format, $val, $unit[$i] );
+}
+
+sub human_level {
+    my $level = shift;
+    return "Full"  if $level eq "F";
+    return "Incr"  if $level eq "I";
+    return "Diff"  if $level eq "D";
+    return "Base"  if $level eq "B";
+    return "None"  if $level eq " ";
+    return "Virt"  if $level eq "f";    # virtual full
+    return "Since" if $level eq "S";
+    return $level;
+}
+
+sub human_status {
+    my $status = shift;
+    return "OK"     if $status eq "T";
+    return "Error"  if $status eq "E";
+    return "Error"  if $status eq "e";
+    return "Fatal"  if $status eq "f";
+    return "Cancel" if $status eq "A";
+    return "Other";
+}
+
+sub list_jobtotals {
+    my $bweb = shift;
+    my $b    = $bweb->get_bconsole();
+    print $b->send_cmd('list jobtotals');
+    print $b->send_cmd('list pools');
+}
+
+sub get_job_log {
+    my $bweb  = shift;
+    my $jobid = shift;
+
+    my $query = "
+SELECT count(1) AS nbline, 
+       GROUP_CONCAT(LogText SEPARATOR '') AS logtxt, id
+  FROM  (
+    SELECT 1 AS id, Time, LogText
+    FROM Log 
+   WHERE ( Log.JobId = $jobid
+      OR (Log.JobId = 0 
+          AND Time >= (SELECT StartTime FROM Job WHERE JobId=$jobid)
+          AND Time <= (SELECT COALESCE(EndTime,NOW()) FROM Job WHERE JobId=$jobid)
+       ) )
+ ORDER BY LogId
+ ) AS temp
+ GROUP BY id
+
+";
+
+    my $log = $bweb->dbh_selectrow_hashref($query);
+
+    return $log->{logtxt};
+}
+
+__END__
+
+=head1 Bacula LastFullStatus Script
