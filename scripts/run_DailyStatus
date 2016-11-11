@@ -1,0 +1,133 @@
+#!/bin/sh
+#! -*- perl -*-
+eval 'exec /usr/bin/perl -x -S $0 ${1+"$@"} ;'
+  if 0;
+
+#
+# Author:  Ulrich Leodolter
+# Date:    2008-12-03
+# Comment: Print Bacula DailyStatus
+#
+
+use strict;
+use Bweb;
+use Getopt::Long;
+
+package DailyStatus;
+
+my $conf = new Bweb::Config( config_file => $Bweb::config_file );
+$conf->load();
+
+my $bweb = new Bweb( info => $conf );
+
+my @groups = ( "Servers", "Users" );
+my $hours  = 24;
+my $result = Getopt::Long::GetOptions(
+    "hours=i"   => \$hours,     # search i hours in the past
+    "groups=s@" => \@groups,    # client groups
+) or die("Error in command line arguments\n");
+
+foreach my $group (@groups) {
+    print <<EOT
+
+Terminated Jobs (last $hours hours) $group Group:
+ JobId  Level     Pool       Files      Bytes   Status   Finished        Name 
+================================================================================
+EOT
+      ;
+    list_terminated_jobs_group( $bweb, $group, $hours );
+}
+
+print <<EOT
+
+List JobTotals
+================================================================================
+EOT
+  ;
+list_jobtotals($bweb);
+
+$bweb->dbh_disconnect;
+
+print <<EOT
+
+--
+Bacula
+It comes by night and sucks the vital essence from your computers. 
+http://$ENV{HOSTNAME}/bweb
+EOT
+  ;
+exit 0;
+
+#
+# subroutines
+#
+sub list_terminated_jobs_group {
+    my $bweb  = shift;
+    my $group = shift;
+    my $hours = shift;
+
+    my $jobs = $bweb->dbh_selectall_hashref( '
+SELECT Job.JobId,Job.Job,Job.JobStatus,Client.Name as ClientName,Job.Name as JobName,Job.Level,
+  Job.StartTime,TIMEDIFF(Job.EndTime,Job.StartTime) AS Duration,
+  DATE_FORMAT(Job.RealEndTime,"%d-%b-%y %H:%i") as RealEndTime,Job.JobFiles,Job.JobBytes,Job.JobErrors,
+  Pool.Name as PoolName,FileSet.FileSet
+  FROM Job
+  LEFT JOIN Client USING(ClientId)
+  LEFT JOIN Pool USING(PoolId)
+  LEFT JOIN FileSet USING(FileSetId)
+  WHERE
+    Job.RealEndTime > SUBTIME(NOW(),MAKETIME(' . $hours . ',0,0))
+  AND Job.JobStatus IN ("T", "E", "e", "f", "A")
+  AND Job.Type = "B"
+  AND ClientId IN
+( SELECT ClientId FROM client_group_member
+  LEFT JOIN client_group USING(client_group_id)
+  WHERE
+    client_group.client_group_name = "' . $group . '" )', 'jobid' );
+
+    foreach
+      my $job ( sort { $a->{realendtime} cmp $b->{realendtime} } values %$jobs )
+    {
+        printf "%6d  ",  $job->{jobid};
+        printf "%5s  ",  human_level( $job->{level} );
+        printf "%-12s ", $job->{poolname};
+        printf "%7d ",   $job->{jobfiles};
+        printf "%10s ",  Bweb::human_size( $job->{jobbytes} );
+        printf " %-7s ", human_status( $job->{jobstatus} );
+        printf " %15s ", $job->{realendtime};
+        print $job->{job}, "\n";
+    }
+}
+
+sub human_level {
+    my $level = shift;
+    return "Full"  if $level eq "F";
+    return "Incr"  if $level eq "I";
+    return "Diff"  if $level eq "D";
+    return "Base"  if $level eq "B";
+    return "None"  if $level eq " ";
+    return "Virt"  if $level eq "f";    # virtual full
+    return "Since" if $level eq "S";
+    return $level;
+}
+
+sub human_status {
+    my $status = shift;
+    return "OK"     if $status eq "T";
+    return "Error"  if $status eq "E";
+    return "Error"  if $status eq "e";
+    return "Fatal"  if $status eq "f";
+    return "Cancel" if $status eq "A";
+    return "Other";
+}
+
+sub list_jobtotals {
+    my $bweb = shift;
+    my $b    = $bweb->get_bconsole();
+    print $b->send_cmd('list jobtotals');
+    print $b->send_cmd('list pools');
+}
+
+__END__
+
+=head1 Bacula DailyStatus Script
