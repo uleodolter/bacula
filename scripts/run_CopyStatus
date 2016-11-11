@@ -1,0 +1,180 @@
+#!/bin/sh
+#! -*- perl -*-
+eval 'exec /usr/bin/perl -x -S $0 ${1+"$@"} ;'
+  if 0;
+
+#
+# Author:  Ulrich Leodolter
+# Date:    2009-01-26
+# Comment: Print Bacula Copy Job Status
+#
+
+use strict;
+use Bweb;
+use Getopt::Long;
+
+package CopyStatus;
+
+my $conf = new Bweb::Config( config_file => $Bweb::config_file );
+$conf->load();
+
+my $bweb = new Bweb( info => $conf );
+
+my $pool   = 'DiskCopy';
+my $hours  = 12;
+my $result = Getopt::Long::GetOptions(
+    "hours=i" => \$hours,     # search i hours in the past
+    "pool=s"  => \$pool,      # copy pool
+) or die("Error in command line arguments\n");
+
+print <<EOT
+
+Copy Jobs into Pool $pool (last $hours hours):
+ NewJob PrevJob Level   Files      Bytes       Rate         Finished              Name 
+=============================================================================================
+EOT
+  ;
+
+wait_jobs($bweb);
+list_copy_jobs( $bweb, $pool, $hours );
+
+$bweb->dbh_disconnect;
+
+print <<EOT
+
+--
+Bacula
+It comes by night and sucks the vital essence from your computers. 
+http://$ENV{HOSTNAME}/bweb
+EOT
+  ;
+exit 0;
+
+#
+# subroutines
+#
+sub list_copy_jobs {
+    my $bweb  = shift;
+    my $pool  = shift;
+    my $hours = shift;
+
+    my $jobs = $bweb->dbh_selectall_hashref( '
+SELECT Job.* FROM Job  LEFT JOIN Pool USING (PoolId)
+  WHERE Job.RealEndTime > SUBTIME(NOW(), MAKETIME('.$hours.',0,0))
+    AND Pool.Name = "' . $pool . '"
+    AND Job.Type = "c"', 'jobid' );
+
+    foreach
+      my $job ( sort { $a->{realendtime} cmp $b->{realendtime} } values %$jobs )
+    {
+        my $logtext = get_job_log( $bweb, $job->{jobid} );
+
+        my $rate      = '';
+        my $prevjobid = 0;
+        my $newjobid  = 0;
+        my $copyjob   = '';
+        my $files     = '';
+        my $bytes     = '';
+
+        $logtext =~ s/\0//;
+
+        if ( $logtext =~ /Copying using JobId=\d+ Job=(.*)/ ) {
+            $copyjob = $1;
+        }
+        if ( $logtext =~ /New Backup JobId:[ ]+(\d+)/ ) {
+            $newjobid = $1;
+        }
+        if ( $logtext =~ /Prev Backup JobId:[ ]+(\d+)/ ) {
+            $prevjobid = $1;
+        }
+        if ( $logtext =~ /Rate:[ ]+(.*)/ ) {
+            $rate = $1;
+        }
+        if ( $logtext =~ /SD Files Written:[ ]+(.*)/ ) {
+            $files = $1;
+        }
+        if ( $logtext =~ /SD Bytes Written:.*\((.*)\)/ ) {
+            $bytes = $1;
+        }
+
+        my $newjob = $bweb->dbh_selectrow_hashref(
+            "SELECT * FROM Job WHERE JobId=$newjobid");
+
+        printf "%7d ",   $newjobid;
+        printf "%7d ",   $prevjobid;
+        printf " %4s ",  human_level( $newjob->{level} );
+        printf " %9s ",  $files;
+        printf " %9s ",  $bytes;
+        printf " %13s ", $rate;
+        printf " %15s ", $job->{realendtime};
+        print " " . $copyjob . "\n";
+    }
+}
+
+sub human_level {
+    my $level = shift;
+    return "Full"  if $level eq "F";
+    return "Incr"  if $level eq "I";
+    return "Diff"  if $level eq "D";
+    return "Base"  if $level eq "B";
+    return "None"  if $level eq " ";
+    return "Virt"  if $level eq "f";    # virtual full
+    return "Since" if $level eq "S";
+    return $level;
+}
+
+sub human_status {
+    my $status = shift;
+    return "OK"     if $status eq "T";
+    return "Error"  if $status eq "E";
+    return "Error"  if $status eq "e";
+    return "Fatal"  if $status eq "f";
+    return "Cancel" if $status eq "A";
+    return "Other";
+}
+
+sub list_jobtotals {
+    my $bweb = shift;
+    my $b    = $bweb->get_bconsole();
+    print $b->send_cmd('list jobtotals');
+    print $b->send_cmd('list pools');
+}
+
+sub wait_jobs {
+    my $bweb = shift;
+    my $b    = $bweb->get_bconsole();
+    my $t    = $b->{timeout};
+    $b->{timeout} = 3600 * 12;
+    print $b->send_cmd('wait');
+    $b->{timeout} = $t;
+}
+
+sub get_job_log {
+    my $bweb  = shift;
+    my $jobid = shift;
+
+    my $query = "
+SELECT count(1) AS nbline, 
+       GROUP_CONCAT(LogText SEPARATOR '') AS logtxt, id
+  FROM  (
+    SELECT 1 AS id, Time, LogText
+    FROM Log 
+   WHERE ( Log.JobId = $jobid
+      OR (Log.JobId = 0 
+          AND Time >= (SELECT StartTime FROM Job WHERE JobId=$jobid)
+          AND Time <= (SELECT COALESCE(EndTime,NOW()) FROM Job WHERE JobId=$jobid)
+       ) )
+ ORDER BY LogId
+ ) AS temp
+ GROUP BY id
+
+";
+
+    my $log = $bweb->dbh_selectrow_hashref($query);
+
+    return $log->{logtxt};
+}
+
+__END__
+
+=head1 Bacula CopyStatus Script
