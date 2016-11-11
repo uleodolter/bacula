@@ -1,0 +1,197 @@
+#!/bin/sh
+#! -*- perl -*-
+eval 'exec /usr/bin/perl -x -S $0 ${1+"$@"} ;'
+  if 0;
+
+#
+# Author:  Ulrich Leodolter
+# Date:    2009-12-14
+# Comment: enable/disable jobs if host alive
+#
+
+use strict;
+use Bweb;
+use Net::Ping;
+
+package CheckUsers;
+
+my $conf = new Bweb::Config( config_file => $Bweb::config_file );
+$conf->load();
+
+my $bweb = new Bweb( info => $conf );
+
+foreach my $group ("Users") {
+    print <<EOT
+
+Check $group Client ping status and enable/disable jobs accordingly.
+
+ Client             Address                   Status    Action
+================================================================================
+EOT
+      ;
+    check_clients_group( $bweb, $group );
+}
+
+$bweb->dbh_disconnect;
+
+print <<EOT
+
+--
+Bacula
+It comes by night and sucks the vital essence from your computers. 
+http://$ENV{HOSTNAME}/bweb
+EOT
+  ;
+exit 0;
+
+#
+# subroutines
+#
+sub check_clients_group {
+    my $bweb  = shift;
+    my $group = shift;
+
+    my $clients = $bweb->dbh_selectall_hashref( '
+SELECT ClientId,Name
+  FROM Client
+  WHERE
+  ClientId IN
+( SELECT ClientId FROM client_group_member
+  LEFT JOIN client_group USING(client_group_id)
+  WHERE
+    client_group.client_group_name = "' . $group . '" )', 'clientid' );
+    foreach my $id ( sort { $a cmp $b } keys %$clients ) {
+        my $client  = $clients->{$id};
+        my $address = get_client_address( $bweb, $client->{name} );
+        my $status  = ping_host($address);
+
+        printf "%-20s", $client->{name};
+        printf "%-26s", $address;
+        printf "%-10s", ( $status ? "alive" : "down" );
+
+        my $cmd = $status ? 'enable' : 'disable';
+
+        my $jobs = get_jobs_from_conf( $client->{name} );
+        foreach my $job_name ( keys %$jobs ) {
+            if ( $jobs->{$job_name}->{enabled} =~ /(yes|true)/ ) {
+                print "$cmd job=$job_name";
+                $bweb->get_bconsole->send_cmd("$cmd job=$job_name");
+            }
+        }
+        print "\n";
+    }
+}
+
+sub ping_host {
+    my $host = shift;
+
+    # my $p = Net::Ping->new('icmp');		# needs root user
+    my $p      = Net::Ping->new('external');    # ping is setuid
+    my $status = $p->ping($host);
+
+    # $p->close();
+    return $status;
+}
+
+sub get_client_address {
+    my $bweb = shift;
+    my $name = shift;
+
+    my $address;
+    my $result = $bweb->get_bconsole->send_cmd("show client=$name");
+    if ( $result =~ / address=([^ ]+) /i ) {
+        $address = $1;
+    }
+    return $address;
+}
+
+sub get_disabled_jobs {
+    my $bweb = shift;
+
+    my $flag = 0;
+    my @jobs;
+    my $result = $bweb->get_bconsole->send_cmd("show disabled");
+    foreach ( split /\r?\n/, $result ) {
+        if (/^Disabled Jobs:/) {
+            $flag = 1;
+            next;
+        }
+        if ( $flag && /^[ ]*([A-Za-z0-9-]+)/ ) {
+            push @jobs, $1;
+        }
+    }
+    return \@jobs;
+}
+
+sub get_jobs {
+    my $result = $bweb->get_bconsole->send_cmd("show jobs");
+    my %jobs;
+
+    my $job_name = undef;
+    foreach ( split /\r?\n/, $result ) {
+
+        # Job: name=Backup-leodolter JobType=66 level=Incremental Priority=10 Enabled=1
+        if (/^Job: name=([^ ]+) JobType=66/) {
+            $job_name = $1;
+            $jobs{$job_name} = { name => $1 };
+        }
+
+        # --> Client: name=leodolter-fd address=leodolter.obvsg.at FDport=9102 MaxJobs=1
+        if (/\-\-> Client: Name=([^ ]+) Enabled=([01]) Address=([^ ]+) /) {
+            $jobs{$job_name}->{client} = { name => $1, enabled => $2, address => $3 };
+        }
+    }
+
+    return \%jobs;
+}
+
+sub get_jobs_from_conf {
+    my $name_fd = shift;
+
+    my %jobs;
+    my $status = '';
+    my $job_name;
+
+    my $name = $name_fd;
+    $name =~ s/-fd$//;
+    unless (
+        open( CONF, '<', '/opt/bacula/etc/conf.d/users-' . $name . '.conf' ) )
+    {
+        print STDERR "cannot open $name.conf\n";
+    }
+    else {
+        while (<CONF>) {
+
+            next if (/^[ \t]*#/);    # skip comment lines
+
+            if (/^Job[ ]*{/) {
+                $status = 'Job';
+            }
+            if (/}/) {
+                $status = '';
+            }
+            if ( $status eq 'Job' ) {
+                if (/Name[ ]*=[ ]*([a-zA-Z0-9-]+)/) {
+                    $job_name                   = $1;
+                    $jobs{$job_name}->{name}    = $job_name;
+                    $jobs{$job_name}->{enabled} = 'yes';       # default
+                }
+                if (/Client[ ]*=[ ]*([a-z0-9-]+)/) {
+                    $jobs{$job_name}->{client} = $1;
+                    if ( $1 ne $name_fd ) {
+                        warn "Client name $1 does not match $name_fd\n";
+                    }
+                }
+                if (/Enabled[ ]*=[ ]*([a-zA-Z]+)/) {
+                    $jobs{$job_name}->{enabled} = lc($1);
+                }
+            }
+        }
+        close CONF;
+    }
+    return \%jobs;
+}
+
+__END__
+
+=head1 Bacula CheckUsers Script
